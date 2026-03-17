@@ -1,0 +1,746 @@
+#include "gps.h"
+
+void gps_init(uint8_t gps_mode_sel); // internal GPS init function, cannot be called outside
+
+_Bool gps_error = 0;
+
+
+int count = 0;
+uint8_t CK_A = 0, CK_B = 0;
+uint8_t ck_data[max_frame] = {0};
+uint8_t ck_bytecount = 0;
+uint8_t txbuf[max_frame] 	= {0};
+const uint8_t baudset9600[] 		= "$PUBX,41,1,0007,0003,9600,0*";
+const uint8_t baudset19200[] 		= "$PUBX,41,1,0007,0003,19200,0*";
+const uint8_t baudset115200[] 	= "$PUBX,41,1,0007,0003,115200,0*";
+const uint8_t baudset921600[] 	= "$PUBX,41,1,0007,0003,921600,0*";
+
+const uint8_t* gps_baud_command[] = {baudset9600, baudset19200, baudset115200, baudset921600};
+
+uint8_t nmea_checksum = 0;
+uint8_t ubx_bytecount = 0;
+
+const uint8_t GPS_RST_HW_RST[]      = {0x00, 0x00, 0x00, 0x00};        
+const uint8_t GPS_RST_GNSS_STOP[] 	= {0x00, 0x00, 0x08, 0x00};
+const uint8_t GPS_RST_GNSS_START[] 	= {0x00, 0x00, 0x09, 0x00};
+const uint8_t GPS_RST_COLDSTART[] 	= {0xFF, 0xFF, 0x02, 0x00};
+const uint8_t GPS_RST_WARMSTART[] 	= {0x00, 0x01, 0x02, 0x00};
+const uint8_t GPS_RST_HOTSTART[] 		= {0x00, 0x00, 0x02, 0x00};
+
+const uint8_t* gps_rst_command[] = {GPS_RST_HW_RST, GPS_RST_GNSS_STOP, GPS_RST_GNSS_START, GPS_RST_COLDSTART, GPS_RST_WARMSTART, GPS_RST_HOTSTART};
+
+const uint8_t GPS_PMS_CFG[] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+
+const uint8_t GPS_MGA_CFG[] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+
+const uint8_t GPS_SBAS_CFG[] = {0x00, 0x03, 0x03, 0x00, 0x89, 0xA3, 0x07, 0x00};
+
+const uint8_t GPS_DCDC_ENABLE[] = {0xB5, 0x62, 0x06, 0x41, 0x0C, 0x00, 0x00, 0x00, 0x03, 0x1F, 0xC5, 0x90, 0xE1, 0x9F, 0xFF, 0xFF, 0xFE, 0xFF, 0x45, 0x79};
+#define GPS_DCDC_LENGTH 20
+
+/*----------------------------------------------------------------------------*/
+extern _Bool gps_fixed;
+uint8_t sendbuf[max_frame]	=	{0};
+uint8_t num = 0, len = 0;
+//char	*RMC;
+
+//uint8_t VTG[max_frame]	=	{0};
+//uint8_t GGA[max_frame]	=	{0};
+//uint8_t GSA[max_frame]	=	{0};
+uint8_t RMC[max_frame]	=	{0};
+uint8_t GSV[max_frame*2]	=	{0};
+//uint8_t GLL[max_frame]	=	{0};
+uint8_t TXT[max_frame]	=	{0};
+
+uint8_t newline[2] = {"\r\n"};
+_Bool gps = 0;
+uint8_t get = 0;
+
+
+uint8_t rxbytecount = 0;
+
+char 	*pnumMsg, 
+	*pMsgnum,
+	*pnumSV, 
+	*pSignalID,
+	*psv,
+	*pcno_26,
+	*ptime = "000000.00",
+	*pstatus,
+	*plat,
+	*pNS, 
+	*plong,
+	*pEW,
+	*pdate = "000000\0",
+  *pposMode;
+/*----------------------------------------------------------------------------*/
+
+void gps_en(_Bool en, uint8_t gps_mode_sel)
+{
+	if(en == GPS_ON)
+	{
+		gps_parameter_reset();
+		
+		HAL_GPIO_WritePin(GPS_EN_GPIO_Port, GPS_EN_Pin, GPIO_PIN_RESET);
+		
+		HAL_Delay(500);
+		
+		gps_init(gps_mode_sel);
+		
+	}
+	else if(en == GPS_OFF)
+	{
+		HAL_GPIO_WritePin(GPS_EN_GPIO_Port, GPS_EN_Pin, GPIO_PIN_SET);
+	}
+}
+
+/*----------------------------------------------------------------------------*/
+
+const uint8_t GPS_GNSS_GPS_Only[] = {
+	
+	/*
+	0x00, 			0x00, no.channel, no.gnss,
+	*/
+	0x00, 			0x00, 0x20, 0x07, 
+	
+	/*
+	GNSSID, 		min, 	max, 	res, 
+	enable, 		0x00, 0x01, 0x01	
+	*/
+	GPS_ID, 		0x08, 0x10, 0x00,
+	0x01, 			0x00, 0x01, 0x01,								//Only GPS enabled
+	
+	SBAS_ID, 		0x01, 0x02, 0x00, 
+	0x00, 			0x00, 0x01, 0x01,
+	
+	Galileo_ID,             0x04, 0x08, 0x00, 
+	0x00, 			0x00, 0x01, 0x01,
+	
+	BeiDou_ID, 	        0x08, 0x10, 0x00, 
+	0x00, 			0x00, 0x01, 0x01,
+	
+	IMES_ID,	 	0x00, 0x08, 0x00, 
+	0x00, 			0x00, 0x01, 0x01,
+	
+	QZSS_ID, 		0x00, 0x03, 0x00, 
+	0x00, 			0x00, 0x01, 0x01,
+	
+	GLONASS_ID, 0x08, 0x0E, 0x00, 
+	0x00, 			0x00, 0x01, 0x01,	
+};
+
+
+/*-------------------------------------------------*/
+_Bool getfix()
+{
+	static _Bool fixed = 0;
+	
+	if(pstatus[0] == 'A')
+	{
+//		HAL_GPIO_WritePin(GPIOB, LED_Pin, GPIO_PIN_SET);
+		fixed = 1;
+		gps_en(GPS_OFF, 0);
+	}
+	else if(pstatus[0] == 'V')
+	{
+//		HAL_GPIO_WritePin(GPIOB, LED_Pin, GPIO_PIN_RESET);
+		fixed = 0;
+	}
+	else
+	{
+//		HAL_GPIO_WritePin(GPIOB, LED_Pin, GPIO_PIN_RESET);
+		fixed = 0;
+	}
+	
+	
+	
+	return fixed;
+}
+
+
+
+/*-------------------------------------------------*/
+void decodeNext(char** ptr)
+{
+	uint8_t strsize;
+
+	strsize = strcspn((*ptr),",*");
+	(*ptr) += strsize;
+
+	(*ptr)[0] = 0;
+	(*ptr)++;
+
+}
+
+
+
+/*-------------------------------------------------*/
+void gps_strcpy(char *data, uint8_t size)
+{
+
+	char tmpstr[5] = {0}, *ptr;
+	strncpy(tmpstr, (char*)data, 6);
+	
+	if(strcmp(tmpstr, "$GPRMC") == 0)
+	{
+		memset(RMC,0,sizeof(RMC));
+		strncpy((char*)RMC, (char*)data, size);
+
+		ptr = (char*)RMC;
+		decodeNext(&ptr);
+		ptime = ptr;
+		decodeNext(&ptr);
+		pstatus = ptr;
+		decodeNext(&ptr);
+		plat = ptr;
+		decodeNext(&ptr);
+		pNS = ptr;
+		decodeNext(&ptr);
+		plong = ptr;
+		decodeNext(&ptr);
+		pEW = ptr;
+		decodeNext(&ptr);
+		decodeNext(&ptr);
+		decodeNext(&ptr);
+		pdate = ptr;
+		decodeNext(&ptr);
+		decodeNext(&ptr);
+		decodeNext(&ptr);
+		pposMode = ptr;
+
+	}
+//	else if(strcmp(tmpstr, "$GPVTG") == 0)
+//	{
+//		memset(VTG,0,sizeof(VTG));
+//		strncpy((char*)VTG, (char*)data, size);
+//	}
+//	else if(strcmp(tmpstr, "$GPGGA") == 0)
+//	{
+//		memset(GGA,0,sizeof(GGA));
+//		strncpy((char*)GGA, (char*)data, size);
+//	}
+//	else if(strcmp(tmpstr, "$GPGSA") == 0)
+//	{
+//		memset(GSA,0,sizeof(GSA));
+//		strncpy((char*)GSA, (char*)data, size);
+//	}	
+	else if(strcmp(tmpstr, "$GPGSV") == 0)
+	{
+		memset(GSV,0,sizeof(GSV));
+		strncpy((char*)GSV, (char*)data, size);
+		ptr = (char*)GSV;
+		decodeNext(&ptr);
+		pnumMsg	= ptr;
+		decodeNext(&ptr);
+		pMsgnum = ptr;
+		decodeNext(&ptr);
+		pnumSV = ptr;
+		decodeNext(&ptr);
+		len = strlen(pnumSV);
+		if(len == 2)
+		{
+			num = ascii2hex(pnumSV[0])*10;
+			num += ascii2hex(pnumSV[1]);
+		}
+		else if(len == 1)
+		{
+			num = ascii2hex(pnumSV[0]);
+		}
+		else {};
+			
+		while(num != 0x00)
+		{
+			num --;
+			psv = ptr;
+			decodeNext(&ptr);
+			if(strcmp(psv, "26")==0)
+			{
+				decodeNext(&ptr);
+				decodeNext(&ptr);
+				pcno_26 = ptr;
+				decodeNext(&ptr);
+			}
+		}
+	}	
+//	else if(strcmp(tmpstr, "$GPGLL") == 0)
+//	{
+//		memset(GLL,0,sizeof(GLL));
+//		strncpy((char*)GLL, (char*)data, size);
+//	}		
+	else if(strcmp(tmpstr, "$GPTXT") == 0)
+	{
+		memset(TXT,0,sizeof(TXT));
+		strncpy((char*)TXT, (char*)data, size);
+	}	
+//	else
+//	{
+//		memset(data,0,sizeof(data));
+//	}
+}
+
+
+/*-------------------------------------------------*/
+void gps_decode()
+{
+	//while((gps_uart.Instance->ISR & USART_ISR_RXNE) == RESET);
+	switch(gps_uart.Instance-> RDR)
+		{
+			case '$':{
+									get = BEGIN;	
+									rxbytecount = 0;	
+									break;}	
+			case '*':{
+									get = STOP;		
+//									rxbytecount = 0;	
+									break;}
+//			default :{get = ERROR	;break;}	
+		}
+		
+		if(get == BEGIN)		
+		{
+			sendbuf[rxbytecount] = gps_uart.Instance->RDR;
+			rxbytecount++;
+		}
+		else if(get == STOP)
+		{
+			gps_strcpy((char*)sendbuf, rxbytecount);
+			get = IDLE;
+		}
+		else if(get == IDLE)
+		{
+			rxbytecount = 0; 
+		}
+//		else if(get == ERROR)
+//		{
+//			rxbytecount = 0;
+//			gps_init();
+//		}
+		gps_uart.Instance->CR1 |= USART_CR1_RXNEIE;
+}
+/*-------------------------------------------------*/
+void gps_uart_tx(uint8_t *data, uint32_t bytecount)
+{
+	if(HAL_UART_Transmit(&gps_uart, data, bytecount, 100)!= HAL_OK)
+	//if(gps_error = 0)
+	{
+		gps_error = 1;
+	}
+	else
+	{
+		gps_error = 0;
+	}
+}
+/*-------------------------------------------------*/
+void gps_gnss_config(const uint8_t* payload)
+{
+	gps_ubx_dataframe gps_gnss_frame;
+	
+	ubx_bytecount= 0;
+	
+	gps_gnss_frame.Sync_Char1 		= UBX_HEADER_H;
+	gps_gnss_frame.Sync_Char2 		= UBX_HEADER_L;
+	gps_gnss_frame.Class 			= UBX_CFG_ID;
+	gps_gnss_frame.ID 			= CFG_GNSS;
+	gps_gnss_frame.Payload_length_H 	= 0x00;
+	gps_gnss_frame.Payload_length_L		= 0x3C;
+	gps_gnss_frame.Payload 			= payload;
+	
+	gps_fill_dataframe(gps_gnss_frame, payload);
+	
+	gps_uart_tx(txbuf, ubx_bytecount);
+}
+
+
+/*-------------------------------------------------*/
+void gps_rst_config(const uint8_t* payload)
+{
+	gps_ubx_dataframe gps_rst_frame;
+	
+	ubx_bytecount= 0;
+	
+	gps_rst_frame.Sync_Char1 	= UBX_HEADER_H;
+	gps_rst_frame.Sync_Char2 	= UBX_HEADER_L;
+	gps_rst_frame.Class 		= UBX_CFG_ID;
+	gps_rst_frame.ID 		= CFG_RST;
+	gps_rst_frame.Payload_length_H 	= 0x00;
+	gps_rst_frame.Payload_length_L	= 0x04;
+	gps_rst_frame.Payload 		= payload;
+	
+	gps_fill_dataframe(gps_rst_frame, payload);
+	
+	gps_uart_tx(txbuf, ubx_bytecount);
+
+}
+/*-------------------------------------------------*/
+void gps_sbas_config(const uint8_t* payload)
+{
+	gps_ubx_dataframe gps_sbas_frame;
+	
+	ubx_bytecount= 0;
+	
+	gps_sbas_frame.Sync_Char1 	= UBX_HEADER_H;
+	gps_sbas_frame.Sync_Char2 	= UBX_HEADER_L;
+	gps_sbas_frame.Class 		= UBX_CFG_ID;
+	gps_sbas_frame.ID 		= CFG_SBAS;
+	gps_sbas_frame.Payload_length_H 	= 0x00;
+	gps_sbas_frame.Payload_length_L	= 0x08;
+	gps_sbas_frame.Payload 		= payload;
+	
+	gps_fill_dataframe(gps_sbas_frame, payload);
+	
+	gps_uart_tx(txbuf, ubx_bytecount);
+}
+/*-------------------------------------------------*/
+void gps_fill_dataframe(gps_ubx_dataframe gps_data, const uint8_t* payload)
+{
+	
+	txbuf[0] = gps_data.Sync_Char1;
+	txbuf[1] = gps_data.Sync_Char2;
+	txbuf[2] = gps_data.Class;
+	txbuf[3] = gps_data.ID;
+	txbuf[4] = gps_data.Payload_length_L;
+	txbuf[5] = gps_data.Payload_length_H;
+	
+	ubx_bytecount = ((gps_data.Payload_length_H * 0x10) + (gps_data.Payload_length_L)) + 6 + 2; 
+	//payload(8)+payload_length(2)+ID(1) + class(1) + header(2)+CK_A_B(2)
+	//8+2+1+1+2+2 = 8+6+2
+	
+	for(int i = 0; i < ubx_bytecount-6-2; i ++)
+	{
+		txbuf[i+6] = payload[i];
+	}
+	
+	gps_ubx_checksum(txbuf+2, ubx_bytecount - 4); //excluding header(2), CK_A_B(2)
+	
+	gps_data.CKA = CK_A;
+	gps_data.CKB = CK_B;
+	
+	txbuf[ubx_bytecount - 2] = CK_A;
+	txbuf[ubx_bytecount - 1] = CK_B;
+}
+/*-------------------------------------------------*/
+void gps_stop()
+{
+	ubx_bytecount= 0;
+	gps_ubx_dataframe gps_stop_ubx;
+	gps_stop_ubx.Sync_Char1                 = UBX_HEADER_H;
+	gps_stop_ubx.Sync_Char2                 = UBX_HEADER_L;
+	gps_stop_ubx.Class 	                = UBX_CFG_ID;
+	gps_stop_ubx.ID 			= CFG_RST;
+	gps_stop_ubx.Payload_length_H           = 0x00;
+	gps_stop_ubx.Payload_length_L           = 0x04;
+	gps_stop_ubx.Payload 			= GPS_RST_GNSS_STOP;
+	
+	gps_fill_dataframe(gps_stop_ubx, GPS_RST_GNSS_STOP);
+	
+	gps_uart_tx(txbuf, ubx_bytecount);
+}
+
+/*-------------------------------------------------*/
+void gps_init(uint8_t gps_mode_sel)
+{
+	ubx_bytecount = 0;
+	
+	uint8_t tx_frame[GPS_DCDC_LENGTH];
+	
+	memcpy(tx_frame, GPS_DCDC_ENABLE, GPS_DCDC_LENGTH);
+	
+	gps_baud_set(9600);
+
+//	HAL_Delay(500);
+	gps_gnss_config(GPS_GNSS_GPS_Only);
+//	HAL_Delay(500);
+	gps_pms_config(GPS_PMS_CFG);	
+//	HAL_Delay(500);
+	
+	gps_uart_tx(tx_frame, GPS_DCDC_LENGTH);				//Command for enabling DCDC
+	
+	switch(gps_mode_sel)
+	{
+		case GPS_COLD_START_SEL: 	{gps_rst_config(GPS_RST_COLDSTART); break;}
+		case GPS_HOT_START_SEL: 	{gps_rst_config(GPS_RST_HOTSTART); break;}
+		case GPS_WARM_START_SEL: 	{gps_rst_config(GPS_RST_WARMSTART); break;}
+		default: {gps_rst_config(GPS_RST_COLDSTART); break;}
+	}
+
+	
+//	HAL_Delay(500);
+	
+	gps_uart.Instance->CR1 |= USART_CR1_RXNEIE;
+		
+}
+/*-------------------------------------------------*/
+void gps_baud_set(uint32_t baud)
+{
+	if(baud == 9600)
+	{
+		gps_nema_uart_tx(baudset9600);
+	}
+	else if(baud == 19200)
+	{
+		gps_nema_uart_tx(baudset19200);
+	}
+	else if(baud == 115200)
+	{
+		gps_nema_uart_tx(baudset115200);
+	}
+	else if(baud == 921600)
+	{
+		gps_nema_uart_tx(baudset921600);
+	}
+	else													// if the input baudrate doesn't match to one of the options, it sets to be 9600 as default
+	{
+		baud = 9600;
+		gps_nema_uart_tx(baudset9600);
+	}
+//	HAL_UART_DeInit(&gps_uart);
+	
+	HAL_Delay(50);
+	
+	gps_uart.Init.BaudRate = baud;
+
+	HAL_UART_Init(&gps_uart);
+
+}
+/*-------------------------------------------------*/
+uint8_t gps_nmea_checksum(const uint8_t *data, int count)
+{
+	int i = 0;
+	nmea_checksum = 0; 
+	uint8_t ck = 0;
+
+	
+	for(i = 1; i < count; i ++)
+	{
+		ck = ck^data[i];
+	}
+
+	return ck;
+	
+}
+
+/*-------------------------------------------------*/
+void gps_nema_uart_tx(const uint8_t* data)
+{
+	count = 0;
+	
+	while(data[0] == '$' && data[count] != '*')
+	{
+		count++;
+	}
+	strcpy((char*)txbuf, (char*)data);
+	
+	nmea_checksum = gps_nmea_checksum(data, count);
+	txbuf[count+1] = hex2ascii(nmea_checksum/0x10);
+	txbuf[count+2] = hex2ascii(nmea_checksum%0x10);
+	txbuf[count+3] = '\r';
+	txbuf[count+4] = '\n';
+	
+	gps_uart_tx(txbuf, count+5);
+}
+/*-------------------------------------------------*/
+//void gps_i2c_send(uint8_t *data, uint8_t bytecount)
+//{
+//	
+
+//	ck_bytecount = bytecount + 2;
+//	
+//	strcpy((char*)ck_data, (char*)data);
+//	gps_ubx_checksum(data, bytecount);
+//	
+//	ck_data[bytecount] = CK_A;
+//	ck_data[bytecount+1] = CK_B;
+
+//	HAL_I2C_Mem_Write(&gps_i2c, gps_dev, 0xb562, 2, ck_data, ck_bytecount - 2, 1000);
+//}
+/*-------------------------------------------------*/
+void gps_ubx_checksum(uint8_t *data, uint8_t bytecount)
+{
+	
+	CK_A = 0; CK_B = 0;
+	for(int i = 0; i < bytecount; i++)
+	{
+		CK_A = CK_A + data[i];
+		CK_B = CK_B + CK_A;
+	}
+	
+	CK_A = CK_A	&	0xFF;
+	CK_B = CK_B	&	0xFF;
+	
+}
+/*-------------------------------------------------*/
+uint8_t hex2ascii(uint8_t input)
+{
+	switch(input)
+	{
+		case 0x0: {return '0';}
+		case 0x1: {return '1';}
+		case 0x2: {return '2';}
+		case 0x3: {return '3';}
+		case 0x4: {return '4';}
+		case 0x5: {return '5';}
+		case 0x6: {return '6';}
+		case 0x7: {return '7';}
+		case 0x8: {return '8';}
+		case 0x9: {return '9';}
+		case 0xA: {return 'A';}
+		case 0xB: {return 'B';}
+		case 0xC: {return 'C';}
+		case 0xD: {return 'D';}
+		case 0xE: {return 'E';}
+		case 0xF: {return 'F';}
+		
+		default: return 0x00;
+	}
+}
+/*-------------------------------------------------*/
+uint8_t ascii2hex(uint8_t input)
+{
+	switch(input)
+	{
+		case '0': {return 0x0;}
+		case '1': {return 0x1;}
+		case '2': {return 0x2;}
+		case '3': {return 0x3;}
+		case '4': {return 0x4;}
+		case '5': {return 0x5;}
+		case '6': {return 0x6;}
+		case '7': {return 0x7;}
+		case '8': {return 0x8;}
+		case '9': {return 0x9;}
+		case 'A': {return 0xA;}
+		case 'B': {return 0xB;}
+		case 'C': {return 0xC;}
+		case 'D': {return 0xD;}
+		case 'E': {return 0xE;}
+		case 'F': {return 0xF;}
+		
+		default: return 0x00;
+	}
+}
+
+/*-------------------------------------------------*/
+void gps_get_lat_long(uint32_t* lati, uint32_t* longi)
+{
+
+	char *pEnd;
+
+	*lati = strtol(plat, &pEnd, 10);
+	*lati = strtol(pEnd+1, &pEnd, 10) + *lati * 100000;
+	*lati = *lati/10;
+	
+//	*lati = ascii2hex(plat[0])*10000000 + ascii2hex(plat[1])*1000000 + ascii2hex(plat[2])*100000 + ascii2hex(plat[3])*10000 + ascii2hex(plat[5])*1000 + ascii2hex(plat[6])*100 + ascii2hex(plat[7])*10 + ascii2hex(plat[8]);
+	
+	if(*pNS == 'S')
+	{
+		*lati = *lati | 0x80000000; 
+	}
+
+	*longi = strtol(plong, &pEnd, 10);
+	*longi = strtol(pEnd+1, &pEnd, 10) + *longi * 100000;
+	*longi = *longi/10;
+	
+	if(*pEW == 'W')
+	{
+		*longi = *longi | 0x80000000; 
+	}
+}
+/*-------------------------------------------------*/
+void gps_pms_config(const uint8_t* payload)
+{
+	gps_ubx_dataframe gps_pms_frame;
+	
+	ubx_bytecount= 0;
+	
+	gps_pms_frame.Sync_Char1 	= UBX_HEADER_H;
+	gps_pms_frame.Sync_Char2 	= UBX_HEADER_L;
+	gps_pms_frame.Class 			= UBX_CFG_ID;
+	gps_pms_frame.ID 					= CFG_PMS;
+	gps_pms_frame.Payload_length_H 	= 0x00;
+	gps_pms_frame.Payload_length_L	= 0x06;
+	gps_pms_frame.Payload 		= payload;
+	
+	gps_fill_dataframe(gps_pms_frame, payload);
+	
+	gps_uart_tx(txbuf, ubx_bytecount);
+
+}
+/*-------------------------------------------------*/
+void gps_get_time_date(struct tm* time_struct)
+{
+	char temp[2];
+
+	
+	strncpy(temp,&ptime[0],2);
+	time_struct->tm_hour = atoi(temp);
+	strncpy(temp,&ptime[2],2);
+	time_struct->tm_min = atoi(temp);
+	strncpy(temp,&ptime[4],2);
+	time_struct->tm_sec = atoi(temp);
+
+	strncpy(temp,&pdate[0],2);
+	time_struct->tm_mday = atoi(temp);
+	strncpy(temp,&pdate[2],2);
+	time_struct->tm_mon = atoi(temp)-1;
+	strncpy(temp,&pdate[4],2);
+	time_struct->tm_year = atoi(temp);
+
+}
+/*-------------------------------------------------*/
+void gps_mga_config(const uint8_t* payload)
+{
+		gps_ubx_dataframe gps_pms_frame;
+	
+	ubx_bytecount= 0;
+	
+	gps_pms_frame.Sync_Char1 	= UBX_HEADER_H;
+	gps_pms_frame.Sync_Char2 	= UBX_HEADER_L;
+	gps_pms_frame.Class 			= UBX_MGA_ID;
+	gps_pms_frame.ID 					= MGA_INI;
+	gps_pms_frame.Payload_length_H 	= 0x00;
+	gps_pms_frame.Payload_length_L	= 0x14;
+	gps_pms_frame.Payload 		= payload;
+	
+	gps_fill_dataframe(gps_pms_frame, payload);
+	
+	gps_uart_tx(txbuf, ubx_bytecount);
+}
+/*-------------------------------------------------*/
+_Bool gps_test(void)
+{
+	
+	if(RMC[0] == '$' && TXT[0] == '$' && GSV[0] == '$')
+	{
+		RMC[0] = 0x00;
+		TXT[0] = 0x00;
+		GSV[0] = 0x00;
+		return 1;
+	}
+	else
+	{
+		return 0;
+	}	
+}
+/*-------------------------------------------------*/
+void gps_parameter_reset(void)
+{
+	gps_fixed = 0;
+	pnumMsg	 	= NULL;
+	pMsgnum   = NULL;
+	pnumSV    = NULL;
+	pSignalID = NULL;
+	psv       = NULL;
+	pcno_26   = NULL;
+	ptime     = NULL;
+	pstatus   = NULL;
+	plat      = NULL;
+	pNS       = NULL;
+	plong     = NULL;
+	pEW       = NULL;
+	pdate     = NULL;
+  pposMode  = NULL;
+	RMC[0]		=	NULL;
+	GSV[0]		= NULL;
+	TXT[0]		=	NULL;
+	
+}
